@@ -1,69 +1,220 @@
-# WATO x UWRT Mars Rover Autonomy Repo
+# WATO x UWRT Mars Rover Autonomy
 
-## Prerequisite Installation
-These steps are to setup the repo to work on your own PC. We utilize docker to enable ease of reproducibility and deployability.
+A ROS 2 navigation stack that works the way NASA's Perseverance rover navigates, running against a procedurally generated Mars world in Ignition Gazebo. Everything runs in Docker, including on an Apple Silicon Mac.
 
-> Why docker? It's so that you don't need to download any coding libraries on your bare metal pc, saving headache :3
+| Perseverance | This repo |
+| --- | --- |
+| ENav: candidate path tree, cheap ranking, then ACE on the best few | `enav` + `rover_core/planner`, `rover_core/ace` |
+| ACE (Approximate Clearance Evaluation, Otsu et al. 2020) | Closed-form interval bounds on rocker, bogie, tilt and belly clearance |
+| Stereo navcam → 2.5D height map | Mast RGB-D navcam → rolling 5 cm height map |
+| Visual odometry overriding wheel odometry | `visual_odometry` (ORB + PnP/RANSAC) replaces wheel motion over each VO interval |
+| IMU + sun finding for attitude | Gyro + gravity + sun sensor attitude filter (Mahony, TRIAD init) |
+| Slip, tilt and suspension fault protection | `mobility` fault monitor, stop and wait for the ground (or auto back-out) |
+| Orbital map localization (HiRISE / Mars Global Localization) | `global_localization`: local height map matched to an orbital DEM |
+| No GPS | No GPS |
 
-1. This repo is supported on Linux Ubuntu >= 22.04, Windows (WSL), and MacOS. This is standard practice that roboticists can't get around. To setup, you can either setup an [Ubuntu Virtual Machine](https://ubuntu.com/tutorials/how-to-run-ubuntu-desktop-on-a-virtual-machine-using-virtualbox#1-overview), setting up [WSL](https://learn.microsoft.com/en-us/windows/wsl/install), or setting up your computer to [dual boot](https://opensource.com/article/18/5/dual-boot-linux). You can find online resources for all three approaches.
-2. Once inside Linux, [Download Docker Engine using the `apt` repository](https://docs.docker.com/engine/install/ubuntu/#install-using-the-repository)
-3. You're all set! You can visit the [WATO Wiki](https://wiki.watonomous.ca/autonomous_software_general/monorepo_infrastructure) for more documentation on the WATO infrastructure.
+## Quick start
 
-## Demo
-https://github.com/user-attachments/assets/d4e821cd-8db7-4176-9e2e-1d9c62aab23d
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Mac) or Docker Engine (Linux). On a Mac, give Docker at least 8 GB of memory (Settings → Resources).
+2. Build and start the simulator, the rover and Foxglove:
 
-![Demo Screenshot](assets/demos/demo_nov30.png)
+   ```bash
+   ./watod build
+   ```
 
-## Simulation Environment
+   ```bash
+   ./watod up
+   ```
 
-We use Ignition Gazebo for physics simulation. The main world file is `robot_env.sdf`, which defines the entire simulation scene.
+   The first build takes a while: it pulls `ros:humble-ros-base`, installs Ignition Fortress and generates the Mars world.
+   - `PLATFORM="local"` in `watod-config.sh` uses a public base image, so no GHCR login is needed. Set it to `arm64`/`amd64` to use the WATonomous images instead.
+   - Without a GHCR login, the build prints `failed to configure registry cache importer ... 403`. That is only the optional remote build cache; the build continues.
+3. Watch it:
+   - **Foxglove**: open [Foxglove](https://app.foxglove.dev), *Open connection* → `ws://localhost:<FOXGLOVE_BRIDGE_PORT>` (the port is in `modules/.env`), then *Import layout* → `config/rover_foxglove_config.json`.
+   - **Gazebo**: open [app.gazebosim.org/visualization](https://app.gazebosim.org/visualization) and connect to `ws://localhost:<GAZEBO_PORT>`.
 
-### Robot Model (SDF)
-A basic model of the rover is defined directly in the SDF with a differential drive base. Key components:
-- **Chassis**: 2.0m x 1.0m x 0.5m box with inertial properties
-- **Wheels**: Four cylindrical wheels with revolute joints
-- **IMU**: Mounted on chassis, publishes to `/imu`
-- **RGBD Camera**: Simulated RealSense D435 mounted on the front
+The default scenario is a long traverse: the rover spins once in place to map its surroundings, then drives to six waypoints on its own. Pick another with the `SCENARIO` variable, e.g. `manual` to choose the goals yourself:
 
-### Depth Camera Simulation
-The depth camera is configured as an `rgbd_camera` sensor with realistic FOV, intrinsics, etc.
+```bash
+SCENARIO=manual ./watod up
+```
 
-It publishes:
-- `/camera/image` ([Image](https://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/Image.html)) - RGB image (used by YOLO object detector)
-- `/camera/points` ([PointCloud2](https://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/PointCloud2.html)) - 3D point cloud (used by costmap)
+| Scenario | What it shows |
+| --- | --- |
+| `traverse` | ~140 m loop over six waypoints: route planning around craters, rocky mounds and boulder walls that sit across the legs, odometry drift and orbital fixes. The dune is a ground-planned keep-out zone. |
+| `manual` | No waypoints: after its startup panorama the rover waits for you to click a goal. |
+| `rock_field` | Straight into a dense rock field: ACE threads between rocks it cannot straddle. |
+| `sand_trap` | A goal on the sandy flank of a dune (~14–15° there, which ACE accepts) with no keep-out zone. The sand is meant to be too loose to climb, so slip detection should stop the rover, then it backs out and marks the hazard. See *Simulation notes*: in Gazebo the sand has not actually cost the rover traction so far. |
 
-### Mars Environment (URDF)
-The environment is loaded from `mars_env.urdf`, which includes meshes for the mars terrain, mallet, and water bottle.
+## Reading the 3D view
 
-The terrain has collision geometry so the rover can't drive through obstacles.
+| What you see | Meaning |
+| --- | --- |
+| Mars surface (`/sim/terrain`) | The simulator's true ground, rocks and sand, lit by the same sun as the navcam. It is for you, not the rover: the rover only knows what its camera and the orbital map show it, so any gap between the rover model and the surface is localization error. Published once (about 3.7 MB), so it adds no ongoing load. |
+| The rover model (body, mast, rockers, bogies, six wheels) | Drawn from its URDF with live joint angles, so you can watch the suspension articulate. The label above it says which goal it is on and how far away it is. |
+| Magenta pillar "GOAL n" | The waypoint it is driving to. Orange: upcoming waypoints. Grey: reached. |
+| Cyan line | The global route: cheapest path to the goal on the cost-to-go grid. |
+| Thick green line | The candidate path ENav chose this cycle; the rover drives its first arc. |
+| Thin red lines | Candidates ACE checked and rejected (too steep, too rough, or not enough clearance). |
+| Grey squares (dark = low, light = high), off by default | The rover's height map from the navcam (`/enav/height_cloud`). |
+| Faint coloured overlay at map height 0, off by default | Route cost: slopes, observed rocks, keep-out zones (`/enav/cost`). |
 
-### ROS2 Bridge
-The `ros_gz_bridge` translates Ignition messages to ROS2 topics, bridging `/cmd_vel`, `/imu`, camera streams, and TF transforms. This way, our ROS2 autonomy stack interface seamlessly with the Gazebo sim.
+Turn layers on and off with the eye icons under *Topics* in the 3D panel's settings. The height map and the cost overlay are what the rover itself perceives; the terrain is what is really there.
 
-## Autonomy Architecture
+## Operating the rover
 
-### Sensor Simulation
-- **gps_sim**: Simulates GPS measurements by reading ground truth transforms from the simulator and injecting realistic noise and dropouts. Publishes [NavSatFix](https://docs.ros.org/en/kinetic/api/sensor_msgs/html/msg/NavSatFix.html) messages.
-- **imu_sim**: Adds sensor noise and bias to clean IMU data to mimic real-world sensors. Takes ground truth IMU and outputs noisy orientation and angular velocity.
+- **Send a goal**: in Foxglove's 3D panel use *Publish point* (it publishes `/goal_point` in the `map` frame). This replaces the scenario's waypoints.
+- **Clear a fault**: the rover stops on a fault and waits, like Perseverance waits for the ground team. Clear it with `ros2 service call /mobility/clear_fault std_srvs/srv/Trigger`. With `auto_recover: true` (scenario files) it backs out and retries by itself.
+- **Look around**: `ros2 service call /mobility/panorama std_srvs/srv/Trigger` rotates the rover once in place.
+- **Force an orbital fix**: `ros2 service call /global_localization/localize std_srvs/srv/Trigger`.
 
-### Localization
-- **localization**: Runs an Extended Kalman Filter (EKF) to fuse (simulated) noisy GPS and IMU data into a smooth, filtered odometry estimate. Outputs robot pose for downstream modules.
+Open a shell in a running container with `./watod -t robot` (or `gazeboserver`).
 
-### Perception & Mapping
-- **costmap**: Converts RGBD camera point clouds into a local 2D occupancy grid centered on the robot. Marks obstacles and inflates them for safety margins.
-- **map_memory**: Stitches together local costmaps into a persistent global map as the rover explores. Only updates when the robot moves beyond a threshold distance to reduce computational load.
-- **yolo_inference**: Runs YOLOv8 object detection (ONNX runtime) on camera images to detect objects like bottles and mallets. Publishes annotated images with bounding boxes.
+## How it works
 
-### Planning & Control
-- **planner**: Implements A* search on the global occupancy grid. Takes the current robot pose and a goal point, outputs a collision-free path. Replans when new goals arrive.
-- **control**: Pure pursuit controller that tracks the planned path. Uses a PID loop (configurable Kp, Ki, Kd gains) to compute steering corrections based on cross-track error. Outputs angular velocity to steer toward the target waypoint while maintaining constant forward velocity, publishing [Twist](https://docs.ros.org/en/jade/api/geometry_msgs/html/msg/Twist.html) commands to `/cmd_vel`.
+```mermaid
+flowchart LR
+  subgraph Gazebo
+    sim[rocker-bogie rover<br/>Mars world]
+  end
+  sim -- /imu /joint_states --> loc[localization]
+  sun[sun_sensor] -- /sun_sensor --> loc
+  sim -- /navcam --> vo[visual_odometry]
+  vo -- /visual_odometry --> loc
+  loc -- odom→base_link, /odom --> enav[enav]
+  sim -- /navcam/depth_image --> enav
+  enav -- /enav/height_map --> gl[global_localization]
+  gl -- map→odom --> enav
+  enav -- /enav/plan --> mob[mobility]
+  loc -- /localization/slip --> mob
+  mob -- /cmd_vel --> sim
+  mob -- /mobility/hazard --> enav
+```
 
-### Data Flow
-The pipeline runs as follows:
-- Sensor sims generate noisy data
-- Localization fuses it into an estimate of the robot's position (odometry)
-- Costmap builds local obstacles
-- Map memory accumulates into global map
-- Planner finds path to goal
-- Control executes path
-- Motor commands actuate the rover
+### The world (`src/common/rover_description`)
+
+`tools/gen_world.py` builds everything from `config/world.yaml` and `config/rover.yaml` at build time:
+
+- **Terrain**: smooth spectral-noise plains, craters with rims, a sand dune (sand covers the dune itself, with a ragged edge), three rocky mounds with ~40° flanks (twice the ACE tilt limit), and a flattened landing pad. Meshes are split into tiles because the renderer uses 16-bit vertex indices.
+- **Rocks**: sizes drawn from the Golombek rock-abundance model used for Mars landing-site hazard analysis, with a dense rock field, rubble on the mounds, and boulders up to 2.8 m across (over 1 m tall). Two groups of big boulders form ~7 m walls across traverse legs.
+- **Surfaces**: soil, sand and rock each have their own friction. Sand is set to 0.18, which should be lower than the dune's steepest slope (~15°) needs; that is the intended sand trap.
+- **Textures**: textured for visual odometry (Mars colors, pebbles, sand ripples), with Mars gravity and a sun that matches the sun sensor.
+- **Orbital DEM**: a 25 cm/px map of the same terrain, blurred and noisy like a HiRISE product. The rover's only global reference.
+- **Rover model**: a rocker-bogie rover with a differential (a small Gazebo plugin in `src/sim/rover_sim`), a mast navcam and an IMU.
+
+### Localization: no GPS (`localization`, `visual_odometry`, `global_localization`)
+
+- **Attitude**: the gyro is integrated and corrected toward gravity (roll, pitch) and the sun (heading). The filter's integral term learns the gyro bias. TRIAD initializes it from one gravity sample and one sun vector.
+- **Position**:
+  - Wheel odometry is integrated as it arrives.
+  - When a visual odometry frame covers an interval, its translation replaces the wheel motion over that interval, as Perseverance does.
+  - Only VO's translation within the rover's deck plane is used: the rover cannot rise through its own chassis, and the out-of-plane component is biased (+1.4 % of distance in simulation).
+  - With all wheels still, VO is ignored (zero-velocity update).
+- **Slip**: `1 − VO forward distance / wheel forward distance` over the last 0.6 m driven, signed. 0 is clean rolling, 1 is wheels spinning in place, above 1 is sliding back while the wheels drive forward.
+- **Global fixes**: every 8 m, the local height map is matched against the orbital DEM.
+  - Both are detrended (best-fit plane removed) and compared by normalized cross-correlation over ±2 m and ±3°.
+  - A match must be distinct: `(1 − runner_up) ≥ 2 (1 − best)` for any peak 1 m or more away.
+  - An accepted match replaces `map → odom`.
+- **Height**: matching ignores height, and odometry height drifts (about 1 % of distance from small pitch errors). Since the rover sits on the ground, `map → odom` height continuously follows the DEM under the estimated position (2 s time constant). Without it the rover model floats over, or sinks into, the terrain in Foxglove.
+
+### ENav (`enav`, `rover_core`)
+
+Each cycle (2 Hz), while the rover is still driving the previous arc:
+
+1. **Height map**: navcam depth goes into a rover-centric 5 cm height map. Each cell keeps the most recent observation.
+   - It is a rolling 12 m window (the camera sees ~7 m). Ground that falls out of the window as the rover moves is dropped, not stored.
+   - What the rover needs to remember about the whole world is kept coarsely, in the 25 cm map-frame route cost below: rocks and steps it has seen, and keep-out zones. That's ~230 KB for the 60 m world.
+   - ACE filters only the part of the window paths can reach (~4 m around the rover).
+2. **Route cost** (map frame), combining:
+   - slope cost from the orbital DEM;
+   - step-height cost from what the rover has seen;
+   - keep-out zones, from scenario files and from hazards found by faults.
+
+   Dijkstra from the goal gives a **cost-to-go** for every cell.
+3. **Path tree**: 972 fixed candidates: 12 turn-in-place headings × 9 × 9 curvatures for two 1.2 m arcs. Each is ranked by route cost plus cost-to-go at its endpoint, plus turn and heading-change penalties.
+4. **ACE**: candidates are checked best-first; the first whose every pose passes wins.
+   - For each wheel, the max-filtered height map gives an interval for the ground under it.
+   - The intervals are pushed through the rocker-bogie linkage in closed form to bound pitch, roll, rocker and bogie angles and belly clearance.
+   - Worst cases are compared against the limits in `rover.yaml`.
+   - Unseen terrain is unknown, never assumed flat, except under the rover during a look-around (at startup, and when recovering).
+5. **Mobility** turns in place to the chosen heading, then follows the first arc with pure pursuit.
+
+### Fault protection (`mobility`)
+
+| Fault | Trigger |
+| --- | --- |
+| Tilt | roll/pitch beyond 25° for 0.5 s |
+| Suspension | rocker or bogie near its hard stop for 0.5 s (a bump off a rock edge is ignored) |
+| Slip | slip magnitude above 60 %: spinning in place, or sliding |
+| Stall | commanded wheel turning, measured wheel not, for 2 s |
+| No safe path | ENav found no safe path for 10 cycles in a row |
+
+On a fault the rover stops. With `auto_recover` it recovers by itself:
+
+- It retraces its own trail backwards for up to 1 m: ground it has just driven over, so no blind turns.
+- For slip, suspension and stall faults it reports a 1.5 m keep-out zone to ENav.
+- After a *no safe path* fault it then looks around: a 360° turn in place, during which ENav throws away its height map and maps the terrain afresh. An odometry error (such as a slip) can leave false steps where terrain seen before it meets terrain seen after it, and those can block every path; a fresh map has none. The turn is not checked by ACE, but it happens on the rover's own trail with fault protection on, like the startup look-around on the landing pad.
+- After `max_recoveries` attempts it waits for the ground. 30 s of fault-free driving restores the budget.
+
+## Measured results
+
+Simulation runs on an Apple M1 (Docker Desktop, software rendering). Errors are against Gazebo ground truth from the `eval` node.
+
+| Scenario | Outcome |
+| --- | --- |
+| `traverse` | **All 6 waypoints reached** in ~6 min (134 m) around the mounds and boulder walls, no faults. Final estimate error 0.10 m; odometry alone drifted 0.4 % of distance. Planning ~14 ms per cycle. An unreachable goal (inside a boulder) gives repeated *no safe path* faults, each followed by a back-out and a look-around, until the recovery budget runs out and the rover waits for the ground. |
+| `rock_field` | Goal reached through the dense rock field, 32.4 m, no faults. Final estimate error 0.12 m, odometry alone 0.45 m (1.4 %). Run with `./watod up`. |
+| `sand_trap` | Both waypoints reached with no faults: the sand did not cost traction in Gazebo (see *Simulation notes*). |
+
+Across runs, odometry alone (wheels + VO) drifts roughly 0.5–3 % of distance driven. The deliberate 0.9 m landing-site error is removed by the first orbital fix, during the startup panorama.
+
+## Development
+
+```bash
+MODE_OF_OPERATION=develop ./watod up
+```
+
+```bash
+./watod -t robot_dev
+```
+
+Inside the container, `src/robot` and `src/common` are mounted at `/ament_ws/src`:
+
+```bash
+colcon build && colcon test && colcon test-result --verbose
+```
+
+Unit tests cover ACE (including a check that the bounds contain every exact configuration), the path tree, cost-to-go, the planner, the attitude filter, dead reckoning, slip, terrain matching, fault protection and the VO motion solver.
+
+| File | What to change there |
+| --- | --- |
+| `src/common/rover_description/config/rover.yaml` | Rover geometry, sensors, ACE and fault limits (used by both the sim and the stack) |
+| `src/common/rover_description/config/world.yaml` | Terrain, craters, dunes, mounds, rock abundance and boulders, sun, friction |
+| `src/robot/bringup_robot/config/params.yaml` | Node parameters |
+| `src/robot/bringup_robot/config/scenarios/*.yaml` | Waypoints, keep-out zones, auto-recovery |
+
+## Simulation notes
+
+- Performance on an M1 with Foxglove attached: the whole stack uses about 1.3 CPU cores (Gazebo ~100 %, robot nodes ~25 %, Foxglove bridge ~5 %) and runs at real time. What it took, biggest win first:
+
+  | Change | Why |
+  | --- | --- |
+  | Shadows off (`sun.shadows` in `world.yaml`) | Gazebo renders in software inside Docker on a Mac; shadow passes doubled its CPU (~300 % → ~150 %). VO tracks the ground texture without them. |
+  | `/clock` at 100 Hz (`rover_sim/SimClock`) | Gazebo's own `/clock` is sent every physics step (250 Hz) to every node running on sim time. |
+  | Joint states at 25 Hz (`rover_sim/JointStates`) | Fortress's publisher sends them every physics step; this also halves `robot_state_publisher`'s TF traffic. |
+  | JPEG navcam for Foxglove (`/navcam/image_viz/compressed`) | ~75 KB/s instead of ~1.2 MB/s of raw images over the websocket. |
+  | Height cloud at 15 cm, every 2 s | ~40 KB/s instead of ~375 KB/s, and far fewer points for Foxglove to draw. |
+  | 12 m height-map window; ACE crops to ~4 m | Less per-cycle work on map cells nothing reads. |
+  | Navcam 320×240 at 5 Hz, physics at 4 ms | Keeps software rendering and physics cheap. |
+
+  Everything uses sim time, so a slower machine only slows the run down.
+- The rover drives at 0.4 m/s and turns in place at 0.6 rad/s, much faster than Perseverance (about 0.04 m/s), to keep demos short (`drive` in `rover.yaml`). At 0.5 m/s, bumps off rocks swing the bogies onto their stops.
+- Depth comes straight from Gazebo's RGB-D camera instead of stereo matching.
+- The sun sensor and the `eval` node read Gazebo ground truth (`/sim/*`). Nothing else does.
+- Gazebo's diff drive commands wheel velocities with no torque limit, so wheels never stall in sim; stall detection matters on hardware.
+  - A torque limit was tried. Wheels then saturate while skid-turning in place, and the drive reaction winds the bogies onto their stops.
+- There is no sinkage, and in testing the sand's lower friction did not stop the rover climbing the dune: it stood on ~14° sand without sliding.
+  - So the sand trap does not yet produce slip in simulation.
+  - Slip detection (spin, slide back, slide forward) is covered by unit tests, and `/localization/slip` is live.
+  - On hardware, or with a wheel–soil model, the same fault path applies.
+- Teleporting the rover with Gazebo's `set_pose` service freezes camera rendering; restart the simulator instead.

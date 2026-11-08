@@ -12,220 +12,234 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "localization/localization_node.hpp"
+// Onboard state estimation, Perseverance style (no GPS):
+//   attitude  = gyro integration corrected by gravity (roll/pitch) and the sun (heading)
+//   position  = wheel odometry, replaced by visual odometry wherever VO succeeded
+//   slip      = 1 - VO distance / wheel distance
+// Publishes odom -> base_link. Global corrections (map -> odom) come from global_localization.
 
-#include <chrono>
+#include <tf2_ros/transform_broadcaster.h>
+
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 
-#include "tf2/LinearMath/Matrix3x3.h"
-#include "tf2/LinearMath/Quaternion.h"
-#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 
-LocalizationNode::LocalizationNode()
-: Node("localization_node")
-, ekf_(this->get_logger())
-, has_cmd_vel_(false)
-, has_imu_(false)
+#include "rover_core/params.hpp"
+#include "rover_core/state_estimation.hpp"
+#include "rover_msgs/msg/slip_estimate.hpp"
+#include "rover_msgs/msg/visual_odometry.hpp"
+
+namespace
 {
-  processParameters();
 
-  // Create publisher
-  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 10);
+using rover_core::AttitudeFilter;
+using rover_core::kWheelJoints;
 
-  // Create subscribers
-  gps_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-    gps_topic_, 10, std::bind(&LocalizationNode::gpsCallback, this, std::placeholders::_1));
+constexpr double kWheelMotionEpsilon = 1e-4;  // rad between joint_states messages
+constexpr double kStationaryTime = 0.3;  // s without wheel motion before VO is ignored
 
-  imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-    imu_topic_, 10, std::bind(&LocalizationNode::imuCallback, this, std::placeholders::_1));
-
-  cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
-    cmd_vel_topic_, 10, std::bind(&LocalizationNode::cmdVelCallback, this, std::placeholders::_1));
-
-  // Create TF buffer and listener (for initialization)
-  if (use_tf_for_init_) {
-    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-  }
-
-  // Create timer for EKF updates
-  int period_ms = static_cast<int>(1000.0 / ekf_update_rate_);
-  timer_ =
-    this->create_wall_timer(std::chrono::milliseconds(period_ms), std::bind(&LocalizationNode::timerCallback, this));
-
-  last_update_time_ = this->now();
-
-  RCLCPP_INFO(this->get_logger(), "Localization Node initialized");
-  RCLCPP_INFO(this->get_logger(), "  GPS topic: %s", gps_topic_.c_str());
-  RCLCPP_INFO(this->get_logger(), "  IMU topic: %s", imu_topic_.c_str());
-  RCLCPP_INFO(this->get_logger(), "  Cmd vel topic: %s", cmd_vel_topic_.c_str());
-  RCLCPP_INFO(this->get_logger(), "  EKF update rate: %.1f Hz", ekf_update_rate_);
+Eigen::Vector3d toEigen(const geometry_msgs::msg::Vector3 & v)
+{
+  return {v.x, v.y, v.z};
 }
 
-void LocalizationNode::processParameters()
+}  // namespace
+
+class LocalizationNode : public rclcpp::Node
 {
-  // Declare parameters
-  this->declare_parameter<std::string>("gps_topic", "/gps/fix");
-  this->declare_parameter<std::string>("imu_topic", "/imu/simulated");
-  this->declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
-  this->declare_parameter<std::string>("odom_topic", "/odom/ekf_filtered");
-  this->declare_parameter<std::string>("source_frame", "sim_world");
-  this->declare_parameter<std::string>("target_frame", "robot/chassis/camera");
-  this->declare_parameter<double>("process_noise_position", 0.1);
-  this->declare_parameter<double>("process_noise_orientation", 0.05);
-  this->declare_parameter<double>("process_noise_velocity", 0.1);
-  this->declare_parameter<double>("gps_measurement_noise", 0.5);
-  this->declare_parameter<double>("imu_measurement_noise_orientation", 0.001);
-  this->declare_parameter<double>("imu_measurement_noise_angular_vel", 0.001);
-  this->declare_parameter<double>("ekf_update_rate", 10.0);
-  this->declare_parameter<bool>("use_tf_for_init", true);
-
-  // Get parameters
-  gps_topic_ = this->get_parameter("gps_topic").as_string();
-  imu_topic_ = this->get_parameter("imu_topic").as_string();
-  cmd_vel_topic_ = this->get_parameter("cmd_vel_topic").as_string();
-  odom_topic_ = this->get_parameter("odom_topic").as_string();
-  source_frame_ = this->get_parameter("source_frame").as_string();
-  target_frame_ = this->get_parameter("target_frame").as_string();
-  process_noise_position_ = this->get_parameter("process_noise_position").as_double();
-  process_noise_orientation_ = this->get_parameter("process_noise_orientation").as_double();
-  process_noise_velocity_ = this->get_parameter("process_noise_velocity").as_double();
-  gps_measurement_noise_ = this->get_parameter("gps_measurement_noise").as_double();
-  imu_measurement_noise_orientation_ = this->get_parameter("imu_measurement_noise_orientation").as_double();
-  imu_measurement_noise_angular_vel_ = this->get_parameter("imu_measurement_noise_angular_vel").as_double();
-  ekf_update_rate_ = this->get_parameter("ekf_update_rate").as_double();
-  use_tf_for_init_ = this->get_parameter("use_tf_for_init").as_bool();
-}
-
-void LocalizationNode::timerCallback()
-{
-  // Initialize EKF from TF if not initialized and TF is enabled
-  if (!ekf_.isInitialized() && use_tf_for_init_ && tf_buffer_) {
-    geometry_msgs::msg::TransformStamped transform_stamped;
-    try {
-      transform_stamped = tf_buffer_->lookupTransform(source_frame_, target_frame_, tf2::TimePointZero);
-
-      double x = transform_stamped.transform.translation.x;
-      double y = transform_stamped.transform.translation.y;
-      double theta = quaternionToYaw(
-        transform_stamped.transform.rotation.x,
-        transform_stamped.transform.rotation.y,
-        transform_stamped.transform.rotation.z,
-        transform_stamped.transform.rotation.w);
-
-      ekf_.initialize(x, y, theta);
-      last_update_time_ = this->now();
-      RCLCPP_INFO(this->get_logger(), "EKF initialized from TF: x=%.2f, y=%.2f, theta=%.2f", x, y, theta);
-      return;
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_DEBUG_THROTTLE(
-        this->get_logger(), *this->get_clock(), 1000, "Waiting for TF transform for initialization: %s", ex.what());
-      return;
-    }
-  }
-
-  if (!ekf_.isInitialized()) {
-    return;
-  }
-
-  // Compute time delta
-  rclcpp::Time current_time = this->now();
-  double dt = (current_time - last_update_time_).seconds();
-  if (dt <= 0.0) {
-    return;
-  }
-
-  // Predict using wheel odometry (cmd_vel)
-  if (has_cmd_vel_) {
-    double vx = latest_cmd_vel_.linear.x;
-    double vy = latest_cmd_vel_.linear.y;
-    double omega = latest_cmd_vel_.angular.z;
-
-    ekf_.predict(vx, vy, omega, dt, process_noise_position_, process_noise_orientation_, process_noise_velocity_);
-  }
-
-  // Publish filtered odometry
-  nav_msgs::msg::Odometry filtered_odom;
-  ekf_.getOdometry(filtered_odom, source_frame_, target_frame_, current_time);
-  odom_pub_->publish(filtered_odom);
-
-  last_update_time_ = current_time;
-}
-
-void LocalizationNode::gpsCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg)
-{
-  if (!ekf_.isInitialized()) {
-    return;
-  }
-
-  // Check GPS status
-  if (msg->status.status != sensor_msgs::msg::NavSatStatus::STATUS_FIX) {
-    return;
-  }
-
-  // Extract measurement noise from covariance if available
-  double measurement_noise = gps_measurement_noise_;
-  if (
-    msg->position_covariance_type == sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN ||
-    msg->position_covariance_type == sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_KNOWN)
+public:
+  LocalizationNode()
+  : Node("localization")
+  , rover_(rover_core::loadRoverParams(rover_core::roverConfigPath()))
+  , sun_world_(rover_core::loadWorldParams(rover_core::worldConfigPath()).sunDirection())
+  , attitude_(AttitudeFilter::Gains{
+      declare_parameter("gravity", 3.721),
+      declare_parameter("kp_gravity", 1.0),
+      declare_parameter("ki_gravity", 0.02),
+      declare_parameter("k_sun", 0.5),
+      declare_parameter("ki_sun", 0.2)})
+  , slip_(
+      declare_parameter("slip_window", 0.6),
+      declare_parameter("slip_min_distance", 0.25),
+      declare_parameter("slip_max_age", 6.0))
+  , odom_frame_(declare_parameter<std::string>("odom_frame", "odom"))
+  , base_frame_(declare_parameter<std::string>("base_frame", "base_link"))
+  , tf_(this)
   {
-    double variance = msg->position_covariance[0];
-    if (variance > 0.0) {
-      measurement_noise = std::sqrt(variance);
+    odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
+    slip_pub_ = create_publisher<rover_msgs::msg::SlipEstimate>("/localization/slip", 10);
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+      "/imu", rclcpp::SensorDataQoS(), [this](sensor_msgs::msg::Imu::ConstSharedPtr m) { onImu(*m); });
+    joint_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+      "/joint_states", rclcpp::SensorDataQoS(), [this](sensor_msgs::msg::JointState::ConstSharedPtr m) {
+        onJoints(*m);
+      });
+    sun_sub_ = create_subscription<geometry_msgs::msg::Vector3Stamped>(
+      "/sun_sensor", 10, [this](geometry_msgs::msg::Vector3Stamped::ConstSharedPtr m) { onSun(*m); });
+    vo_sub_ = create_subscription<rover_msgs::msg::VisualOdometry>(
+      "/visual_odometry", 10, [this](rover_msgs::msg::VisualOdometry::ConstSharedPtr m) { onVisualOdometry(*m); });
+  }
+
+private:
+  void onImu(const sensor_msgs::msg::Imu & msg)
+  {
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    const Eigen::Vector3d gyro = toEigen(msg.angular_velocity);
+    const Eigen::Vector3d accel = toEigen(msg.linear_acceleration);
+
+    if (!attitude_.initialized()) {
+      // Wait at rest for the first sun fix, averaging gravity meanwhile.
+      accel_sum_ += accel;
+      ++accel_count_;
+      if (sun_body_ && accel_count_ >= 25) {
+        attitude_.initialize(accel_sum_ / accel_count_, *sun_body_, sun_world_);
+        last_imu_ = stamp;
+        wheel_distance_ = 0.0;
+        dead_reckoning_.addWheelMotion(stamp, 0.0, attitude_.orientation());
+        RCLCPP_INFO(get_logger(), "Attitude initialized from gravity and the sun (TRIAD)");
+      }
+      return;
     }
+    const double dt = stamp - last_imu_;
+    last_imu_ = stamp;
+    if (dt <= 0.0 || dt > 0.2) return;
+
+    attitude_.propagate(gyro, accel, dt);
+    dead_reckoning_.addWheelMotion(stamp, wheel_distance_, attitude_.orientation());
+    const double speed = wheel_distance_ / dt;
+    wheel_distance_ = 0.0;
+    publish(msg.header.stamp, speed, gyro - attitude_.gyroBias());
   }
 
-  // Update EKF with GPS
-  ekf_.updateGPS(msg->latitude, msg->longitude, measurement_noise);
-}
-
-void LocalizationNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
-{
-  latest_imu_ = *msg;
-  has_imu_ = true;
-
-  if (!ekf_.isInitialized()) {
-    return;
+  void onJoints(const sensor_msgs::msg::JointState & msg)
+  {
+    if (wheel_index_[0] < 0) {
+      for (size_t k = 0; k < kWheelJoints.size(); ++k) {
+        for (size_t i = 0; i < msg.name.size(); ++i) {
+          if (msg.name[i] == kWheelJoints[k]) wheel_index_[k] = static_cast<int>(i);
+        }
+        if (wheel_index_[k] < 0) throw std::runtime_error("joint_states is missing " + kWheelJoints[k]);
+      }
+    }
+    std::array<double, 6> position;
+    for (size_t k = 0; k < 6; ++k) position[k] = msg.position[wheel_index_[k]];
+    if (last_wheel_) {
+      double sum = 0.0;
+      double largest = 0.0;
+      for (size_t k = 0; k < 6; ++k) {
+        sum += position[k] - (*last_wheel_)[k];
+        largest = std::max(largest, std::abs(position[k] - (*last_wheel_)[k]));
+      }
+      if (largest > kWheelMotionEpsilon) last_wheel_motion_ = rclcpp::Time(msg.header.stamp).seconds();
+      // Ignore motion before the attitude (and so the odom frame) exists.
+      if (attitude_.initialized()) wheel_distance_ += sum / 6.0 * rover_.wheel_radius;
+    }
+    last_wheel_ = position;
   }
 
-  // Extract orientation
-  double theta = quaternionToYaw(msg->orientation.x, msg->orientation.y, msg->orientation.z, msg->orientation.w);
-
-  // Extract measurement noise from covariance
-  double orientation_noise = imu_measurement_noise_orientation_;
-  if (msg->orientation_covariance[8] > 0.0) {
-    orientation_noise = std::sqrt(msg->orientation_covariance[8]);
+  void onSun(const geometry_msgs::msg::Vector3Stamped & msg)
+  {
+    const double stamp = rclcpp::Time(msg.header.stamp).seconds();
+    sun_body_ = toEigen(msg.vector).normalized();
+    if (attitude_.initialized() && stamp > last_sun_) {
+      attitude_.correctSun(*sun_body_, sun_world_, last_sun_ > 0.0 ? stamp - last_sun_ : 1.0);
+    }
+    last_sun_ = stamp;
   }
 
-  // Update EKF with IMU orientation
-  ekf_.updateIMUOrientation(theta, orientation_noise);
-
-  // Update EKF with IMU angular velocity
-  double angular_vel_noise = imu_measurement_noise_angular_vel_;
-  if (msg->angular_velocity_covariance[8] > 0.0) {
-    angular_vel_noise = std::sqrt(msg->angular_velocity_covariance[8]);
+  void onVisualOdometry(const rover_msgs::msg::VisualOdometry & msg)
+  {
+    rover_msgs::msg::SlipEstimate out;
+    out.header = msg.header;
+    const double t1 = rclcpp::Time(msg.header.stamp).seconds();
+    // Zero-velocity update: with every wheel still, the rover is not moving, so VO noise must
+    // not be integrated into the position.
+    const bool stationary = t1 - last_wheel_motion_ > kStationaryTime;
+    if (msg.valid && attitude_.initialized() && !stationary) {
+      const auto & p = msg.delta.position;
+      const auto update =
+        dead_reckoning_.applyVisualOdometry(rclcpp::Time(msg.previous_stamp).seconds(), t1, {p.x, p.y, p.z});
+      if (update) slip_.add(t1, update->wheel_distance, update->vo_distance);
+    }
+    const std::optional<double> slip = slip_.slip(t1);
+    out.valid = slip.has_value();
+    out.slip = static_cast<float>(slip.value_or(0.0));
+    out.wheel_distance = static_cast<float>(slip_.wheelDistance());
+    out.vo_distance = static_cast<float>(slip_.voDistance());
+    slip_pub_->publish(out);
   }
 
-  ekf_.updateIMUAngularVel(msg->angular_velocity.z, angular_vel_noise);
-}
+  void publish(const builtin_interfaces::msg::Time & stamp, double speed, const Eigen::Vector3d & angular)
+  {
+    const Eigen::Vector3d & p = dead_reckoning_.position();
+    const Eigen::Quaterniond & q = attitude_.orientation();
 
-void LocalizationNode::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
-{
-  latest_cmd_vel_ = *msg;
-  has_cmd_vel_ = true;
-  last_cmd_vel_time_ = this->now();
-}
+    nav_msgs::msg::Odometry odom;
+    odom.header.stamp = stamp;
+    odom.header.frame_id = odom_frame_;
+    odom.child_frame_id = base_frame_;
+    odom.pose.pose.position.x = p.x();
+    odom.pose.pose.position.y = p.y();
+    odom.pose.pose.position.z = p.z();
+    odom.pose.pose.orientation.x = q.x();
+    odom.pose.pose.orientation.y = q.y();
+    odom.pose.pose.orientation.z = q.z();
+    odom.pose.pose.orientation.w = q.w();
+    odom.pose.covariance[0] = odom.pose.covariance[7] = dead_reckoning_.positionVariance();
+    odom.pose.covariance[35] = 3e-4;
+    odom.twist.twist.linear.x = speed;
+    odom.twist.twist.angular.x = angular.x();
+    odom.twist.twist.angular.y = angular.y();
+    odom.twist.twist.angular.z = angular.z();
+    odom_pub_->publish(odom);
 
-double LocalizationNode::quaternionToYaw(double x, double y, double z, double w)
-{
-  tf2::Quaternion q(x, y, z, w);
-  tf2::Matrix3x3 m(q);
-  double roll, pitch, yaw;
-  m.getRPY(roll, pitch, yaw);
-  return yaw;
-}
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header = odom.header;
+    tf.child_frame_id = base_frame_;
+    tf.transform.translation.x = p.x();
+    tf.transform.translation.y = p.y();
+    tf.transform.translation.z = p.z();
+    tf.transform.rotation = odom.pose.pose.orientation;
+    tf_.sendTransform(tf);
+  }
+
+  const rover_core::RoverParams rover_;
+  const Eigen::Vector3d sun_world_;
+  AttitudeFilter attitude_;
+  rover_core::DeadReckoning dead_reckoning_;
+  rover_core::SlipEstimator slip_;
+  const std::string odom_frame_;
+  const std::string base_frame_;
+  tf2_ros::TransformBroadcaster tf_;
+
+  Eigen::Vector3d accel_sum_{Eigen::Vector3d::Zero()};
+  int accel_count_{0};
+  std::optional<Eigen::Vector3d> sun_body_;
+  double last_imu_{0.0};
+  double last_sun_{0.0};
+  double last_wheel_motion_{0.0};
+  double wheel_distance_{0.0};
+  std::array<int, 6> wheel_index_{-1, -1, -1, -1, -1, -1};
+  std::optional<std::array<double, 6>> last_wheel_;
+
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  rclcpp::Publisher<rover_msgs::msg::SlipEstimate>::SharedPtr slip_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr sun_sub_;
+  rclcpp::Subscription<rover_msgs::msg::VisualOdometry>::SharedPtr vo_sub_;
+};
 
 int main(int argc, char ** argv)
 {
